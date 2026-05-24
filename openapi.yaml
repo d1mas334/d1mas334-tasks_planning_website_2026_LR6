@@ -1,8 +1,8 @@
 openapi: 3.0.3
 info:
   title: Task Planning API
-  description: REST API for laboratory work 05, variant 10, task planning with Redis caching and rate limiting.
-  version: 1.1.0
+  description: REST API for laboratory work 06, variant 10, task planning with Redis caching, rate limiting, and RabbitMQ domain events.
+  version: 1.2.0
 servers:
   - url: http://localhost:8080
 security:
@@ -27,6 +27,7 @@ paths:
   /api/users:
     post:
       summary: Create a new user
+      description: Creates a user in PostgreSQL and publishes the user.created domain event to RabbitMQ.
       security: []
       requestBody:
         required: true
@@ -124,6 +125,7 @@ paths:
   /api/goals:
     post:
       summary: Create a goal
+      description: Creates a goal in PostgreSQL, invalidates the Redis goals cache, and publishes the goal.created domain event to RabbitMQ.
       requestBody:
         required: true
         content:
@@ -168,6 +170,7 @@ paths:
         example: 1
     post:
       summary: Create a task for a goal
+      description: Creates a task in PostgreSQL, invalidates the Redis goal tasks cache, and publishes the task.created domain event to RabbitMQ.
       requestBody:
         required: true
         content:
@@ -210,7 +213,7 @@ paths:
   /api/goals/{goalId}/tasks/{taskId}/status:
     patch:
       summary: Change task status
-      description: Updates task status in PostgreSQL and writes a status_changed event to MongoDB task_activity.
+      description: Updates task status in PostgreSQL, invalidates the Redis goal tasks cache, writes status_changed activity to MongoDB, and publishes the task.status_changed domain event to RabbitMQ.
       parameters:
         - name: goalId
           in: path
@@ -263,7 +266,7 @@ paths:
         example: 1
     post:
       summary: Add a comment to a task
-      description: Stores a task comment document in MongoDB task_comments.
+      description: Stores a task comment document in MongoDB task_comments and publishes the task.comment_added domain event to RabbitMQ.
       requestBody:
         required: true
         content:

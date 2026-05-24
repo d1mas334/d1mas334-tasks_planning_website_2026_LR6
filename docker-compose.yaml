@@ -34,6 +34,19 @@ services:
       timeout: 5s
       retries: 10
 
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: task_planning
+      RABBITMQ_DEFAULT_PASS: task_planning
+    ports:
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   task-planning-api:
     build: .
     depends_on:
@@ -43,5 +56,25 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     ports:
       - "${API_PORT:-8080}:8080"
+
+  event-worker:
+    build: .
+    command: ["python3", "/app/worker/event_worker.py"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: task_planning
+      RABBITMQ_PASSWORD: task_planning
+      RABBITMQ_VHOST: /
+      RABBITMQ_EXCHANGE: task_planning.events
+      RABBITMQ_QUEUE: audit.queue
+      MONGO_URI: mongodb://mongo:27017/task_planning_mongo

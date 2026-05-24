@@ -67,6 +67,8 @@ components_manager:
 
     redis-storage: {}
 
+    event-publisher: {}
+
     testsuite-support: {}
 
     handler-ping:

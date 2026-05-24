@@ -140,9 +140,46 @@ ensureCollection('notification_log', {
   },
 });
 
+ensureCollection('event_log', {
+  $jsonSchema: {
+    bsonType: 'object',
+    required: ['eventId', 'eventType', 'occurredAt', 'producer', 'version', 'payload', 'processedAt', 'status'],
+    additionalProperties: true,
+    properties: {
+      eventId: {
+        bsonType: 'string',
+        description: 'Domain event idempotency key',
+      },
+      eventType: {
+        bsonType: 'string',
+        enum: [
+          'user.created',
+          'goal.created',
+          'task.created',
+          'task.status_changed',
+          'task.comment_added',
+          'notification.requested',
+          'read_model.updated',
+        ],
+      },
+      occurredAt: { bsonType: 'date' },
+      producer: { bsonType: ['string', 'null'] },
+      version: { bsonType: ['int', 'long'] },
+      payload: { bsonType: 'object' },
+      processedAt: { bsonType: 'date' },
+      status: {
+        bsonType: 'string',
+        enum: ['processed', 'failed', 'ignored'],
+      },
+    },
+  },
+});
+
 database.task_comments.createIndex({ taskId: 1, createdAt: 1 });
 database.task_activity.createIndex({ taskId: 1, type: 1, createdAt: -1 });
 database.notification_log.createIndex({ 'recipient.userId': 1, createdAt: -1 });
 database.notification_log.createIndex({ status: 1, createdAt: -1 });
+database.event_log.createIndex({ eventId: 1 }, { unique: true });
+database.event_log.createIndex({ eventType: 1, occurredAt: -1 });
 
 print(`validation is ready for ${dbName}`);
