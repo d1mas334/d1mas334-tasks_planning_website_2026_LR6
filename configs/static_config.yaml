@@ -1,0 +1,131 @@
+components_manager:
+  task_processors:
+    main-task-processor:
+      worker_threads: 4
+    fs-task-processor:
+      worker_threads: 1
+  default_task_processor: main-task-processor
+
+  components:
+    server:
+      listener:
+        port: 8080
+        task_processor: main-task-processor
+
+    logging:
+      fs-task-processor: fs-task-processor
+      loggers:
+        default:
+          file_path: '@stderr'
+          level: info
+          overflow_behavior: discard
+
+    dns-client: {}
+
+    secdist:
+      provider: default-secdist-provider
+
+    default-secdist-provider:
+      config: /app/configs/secdist.json
+      missing-ok: false
+
+    task-planning-db:
+      dbconnection: 'postgresql://task_planning:task_planning@postgres:5432/task_planning'
+      blocking_task_processor: fs-task-processor
+      dns_resolver: getaddrinfo
+      min_pool_size: 1
+      max_pool_size: 5
+      max_queue_size: 200
+
+    task-planning-mongo:
+      dbconnection: 'mongodb://mongo:27017/task_planning_mongo'
+      appname: task-planning-api
+      conn_timeout: 2s
+      so_timeout: 10s
+      queue_timeout: 1s
+      initial_size: 2
+      max_size: 10
+      idle_limit: 5
+      connecting_limit: 2
+      local_threshold: 15ms
+      maintenance_period: 15s
+      stats_verbosity: terse
+
+    task-planning-cache:
+      groups:
+        - config_name: task-planning-cache
+          db: task-planning-cache
+          sharding_strategy: RedisStandalone
+      subscribe_groups: []
+      thread_pools:
+        redis_thread_pool_size: 2
+        sentinel_thread_pool_size: 1
+
+    postgres-storage: {}
+
+    mongo-storage: {}
+
+    redis-storage: {}
+
+    testsuite-support: {}
+
+    handler-ping:
+      path: /ping
+      method: GET
+      task_processor: main-task-processor
+
+    handler-users:
+      path: /api/users
+      method: POST
+      task_processor: main-task-processor
+
+    handler-login:
+      path: /api/auth/login
+      method: POST
+      task_processor: main-task-processor
+
+    handler-user-by-login:
+      path: /api/users/by-login
+      method: GET
+      task_processor: main-task-processor
+
+    handler-user-search:
+      path: /api/users/search
+      method: GET
+      task_processor: main-task-processor
+
+    handler-goals:
+      path: /api/goals
+      method: GET,POST
+      task_processor: main-task-processor
+
+    handler-goal-tasks:
+      path: /api/goals/{goalId}/tasks
+      method: GET,POST
+      task_processor: main-task-processor
+
+    handler-task-status:
+      path: /api/goals/{goalId}/tasks/{taskId}/status
+      method: PATCH
+      task_processor: main-task-processor
+
+    handler-task-comments:
+      path: /api/goals/{goalId}/tasks/{taskId}/comments
+      method: GET,POST
+      task_processor: main-task-processor
+
+    handler-task-activity:
+      path: /api/goals/{goalId}/tasks/{taskId}/activity
+      method: GET
+      task_processor: main-task-processor
+
+    dynamic-config:
+      defaults:
+        POSTGRES_CONNECTION_POOL_SETTINGS:
+          task-planning-db:
+            min_pool_size: 1
+            max_pool_size: 5
+            max_queue_size: 200
+        POSTGRES_STATEMENT_METRICS_SETTINGS:
+          task-planning-db:
+            max_statement_metrics: 20
