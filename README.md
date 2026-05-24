@@ -1,4 +1,4 @@
-# Лабораторная работа 05. Оптимизация производительности через кеширование и rate limiting
+# Лабораторная работа 06. Проектирование Event-Driven архитектуры
 
 ## Дисциплина
 
@@ -14,7 +14,7 @@
 - цель;
 - задача.
 
-ЛР5 развивает результат ЛР4: REST API на C++20 / Yandex Userver продолжает использовать PostgreSQL 16 для `users`, `goals`, `tasks` и MongoDB 7 для `task_activity`, `task_comments`, `notification_log`. Новое в ЛР5: Redis 7, Cache-Aside кеширование горячих read endpoints и fixed-window rate limiting.
+ЛР6 развивает результат ЛР5: REST API на C++20 / Yandex Userver продолжает использовать PostgreSQL 16 для `users`, `goals`, `tasks`, MongoDB 7 для `task_activity`, `task_comments`, `notification_log`, Redis 7 для Cache-Aside кеширования и rate limiting. Новое в ЛР6: RabbitMQ 3 Management, topic exchange, durable queues, producer в API и отдельный `event-worker` consumer.
 
 ## Технологии
 
@@ -23,6 +23,7 @@
 - PostgreSQL 16;
 - MongoDB 7;
 - Redis 7;
+- RabbitMQ 3 Management;
 - Docker Compose;
 - REST API.
 
@@ -46,11 +47,15 @@
 │   └── queries.js
 ├── src/
 │   └── main.cpp
+├── worker/
+│   └── event_worker.py
 ├── tests/
 │   └── curl_examples.md
 ├── schema_design.md
 ├── optimization.md
 ├── performance_design.md
+├── event_driven_design.md
+├── event_catalog.md
 └── openapi.yaml
 ```
 
@@ -76,9 +81,20 @@ Redis используется как инфраструктурный слой:
 
 Подробное проектирование кеширования, rate limiting, hot paths, slow operations и метрик описано в [performance_design.md](performance_design.md).
 
+RabbitMQ используется как broker событий:
+
+- exchange `task_planning.events`, type `topic`, durable;
+- queue `notification.queue` для уведомлений;
+- queue `read_model.queue` для CQRS-проекций;
+- queue `audit.queue` для полного аудита;
+- producer встроен в C++ API через `rabbitmq-c`;
+- consumer `event-worker` читает `audit.queue`, пишет `event_log` и обновляет `task_activity`.
+
+Подробное проектирование Event-Driven архитектуры описано в [event_driven_design.md](event_driven_design.md), каталог событий - в [event_catalog.md](event_catalog.md).
+
 ## Запуск
 
-Собрать и запустить API, PostgreSQL, MongoDB и Redis:
+Собрать и запустить API, PostgreSQL, MongoDB, Redis, RabbitMQ и worker:
 
 ```bash
 docker compose up --build
@@ -105,21 +121,29 @@ docker compose up --build
 
 В README основной адрес остается `http://localhost:8080`.
 
+RabbitMQ Management UI доступен по адресу:
+
+```text
+http://localhost:15672
+login: task_planning
+password: task_planning
+```
+
 ## API endpoints
 
 | Метод | URL | Назначение | Auth |
 |---|---|---|---|
 | GET | `/ping` | Проверка сервиса | Нет |
-| POST | `/api/users` | Создание пользователя | Нет |
+| POST | `/api/users` | Создание пользователя, публикует `user.created` | Нет |
 | POST | `/api/auth/login` | Получение bearer token | Нет |
 | GET | `/api/users/by-login?login=alexey` | Поиск пользователя по логину | Да |
 | GET | `/api/users/search?mask=iv` | Поиск пользователей по имени/фамилии, rate limited | Да |
-| POST | `/api/goals` | Создание цели, инвалидирует `goals:all` | Да |
+| POST | `/api/goals` | Создание цели, инвалидирует `goals:all`, публикует `goal.created` | Да |
 | GET | `/api/goals` | Получение целей, `X-Cache: HIT/MISS` | Да |
-| POST | `/api/goals/{goalId}/tasks` | Создание задачи, инвалидирует `goal:{goalId}:tasks` | Да |
+| POST | `/api/goals/{goalId}/tasks` | Создание задачи, инвалидирует `goal:{goalId}:tasks`, публикует `task.created` | Да |
 | GET | `/api/goals/{goalId}/tasks` | Получение задач цели, `X-Cache: HIT/MISS` | Да |
-| PATCH | `/api/goals/{goalId}/tasks/{taskId}/status` | Изменение статуса, инвалидирует `goal:{goalId}:tasks` | Да |
-| POST | `/api/goals/{goalId}/tasks/{taskId}/comments` | Добавить комментарий к задаче | Да |
+| PATCH | `/api/goals/{goalId}/tasks/{taskId}/status` | Изменение статуса, инвалидирует `goal:{goalId}:tasks`, публикует `task.status_changed` | Да |
+| POST | `/api/goals/{goalId}/tasks/{taskId}/comments` | Добавить комментарий к задаче, публикует `task.comment_added` | Да |
 | GET | `/api/goals/{goalId}/tasks/{taskId}/comments` | Получить комментарии задачи из MongoDB | Да |
 | GET | `/api/goals/{goalId}/tasks/{taskId}/activity` | Получить историю активности задачи из MongoDB | Да |
 
@@ -208,6 +232,74 @@ curl -i -X PATCH http://localhost:8080/api/goals/1/tasks/1/status \
 
 curl -i http://localhost:8080/api/goals/1/tasks \
   -H "Authorization: Bearer $TOKEN"
+```
+
+## Проверка RabbitMQ producer/consumer
+
+Write endpoints публикуют domain events после успешной записи:
+
+| Endpoint | Event |
+|---|---|
+| `POST /api/users` | `user.created` |
+| `POST /api/goals` | `goal.created` |
+| `POST /api/goals/{goalId}/tasks` | `task.created` |
+| `PATCH /api/goals/{goalId}/tasks/{taskId}/status` | `task.status_changed` |
+| `POST /api/goals/{goalId}/tasks/{taskId}/comments` | `task.comment_added` |
+
+Создать событие `goal.created`:
+
+```bash
+curl -i -X POST http://localhost:8080/api/goals \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"title":"Event-driven architecture check","description":"Goal created to publish goal.created"}'
+```
+
+Создать событие `task.created`:
+
+```bash
+curl -i -X POST http://localhost:8080/api/goals/1/tasks \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"title":"RabbitMQ event task","description":"Task created to publish task.created","assigneeId":2,"dueDate":"2026-06-30"}'
+```
+
+Создать событие `task.status_changed`:
+
+```bash
+curl -i -X PATCH http://localhost:8080/api/goals/1/tasks/1/status \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"status":"in_progress"}'
+```
+
+Создать событие `task.comment_added`:
+
+```bash
+curl -i -X POST http://localhost:8080/api/goals/1/tasks/1/comments \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"text":"RabbitMQ comment event check","tags":["rabbitmq","event"]}'
+```
+
+Посмотреть обработку consumer:
+
+```bash
+docker compose logs event-worker
+```
+
+Проверить, что событие обработано и записано в MongoDB `event_log`:
+
+```bash
+docker compose exec -T mongo mongosh --quiet --eval \
+  "db.getSiblingDB('task_planning_mongo').event_log.find({}, {eventId:1,eventType:1,processedAt:1}).sort({processedAt:-1}).limit(10).toArray()"
+```
+
+Проверить, что worker обновил MongoDB `task_activity`:
+
+```bash
+docker compose exec -T mongo mongosh --quiet --eval \
+  "db.getSiblingDB('task_planning_mongo').task_activity.find({taskId: 1}).sort({createdAt:-1}).limit(10).toArray()"
 ```
 
 ## Rate limiting

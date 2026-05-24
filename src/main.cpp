@@ -1,14 +1,23 @@
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <ctime>
+#include <iomanip>
 #include <optional>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include <amqp.h>
+#include <amqp_framing.h>
+#include <amqp_tcp_socket.h>
 
 #include <userver/components/component_base.hpp>
 #include <userver/components/component_context.hpp>
@@ -577,6 +586,230 @@ class RedisStorage final : public components::ComponentBase {
   redis::CommandControl redis_cc_;
 };
 
+struct RabbitMqSettings {
+  std::string host;
+  int port{};
+  std::string vhost;
+  std::string username;
+  std::string password;
+  std::string exchange;
+};
+
+std::string MakeRabbitErrorMessage(amqp_rpc_reply_t reply,
+                                   std::string_view action) {
+  std::string message = "RabbitMQ ";
+  message += action;
+  message += " failed";
+
+  if (reply.reply_type == AMQP_RESPONSE_LIBRARY_EXCEPTION) {
+    message += ": ";
+    message += amqp_error_string2(reply.library_error);
+  } else if (reply.reply_type == AMQP_RESPONSE_SERVER_EXCEPTION) {
+    message += ": server exception";
+  } else {
+    message += ": unexpected AMQP response";
+  }
+
+  return message;
+}
+
+void CheckAmqpReply(amqp_rpc_reply_t reply, std::string_view action) {
+  if (reply.reply_type != AMQP_RESPONSE_NORMAL) {
+    throw std::runtime_error(MakeRabbitErrorMessage(reply, action));
+  }
+}
+
+amqp_bytes_t MakeAmqpBytes(std::string_view value) {
+  return amqp_bytes_t{value.size(), const_cast<char*>(value.data())};
+}
+
+class RabbitConnection final {
+ public:
+  static constexpr amqp_channel_t kChannel = 1;
+
+  explicit RabbitConnection(const RabbitMqSettings& settings)
+      : connection_(amqp_new_connection()) {
+    try {
+      auto* socket = amqp_tcp_socket_new(connection_);
+      if (socket == nullptr) {
+        throw std::runtime_error("RabbitMQ TCP socket creation failed");
+      }
+
+      const auto open_status =
+          amqp_socket_open(socket, settings.host.c_str(), settings.port);
+      if (open_status != AMQP_STATUS_OK) {
+        std::string message = "RabbitMQ socket open failed: ";
+        message += amqp_error_string2(open_status);
+        throw std::runtime_error(message);
+      }
+
+      CheckAmqpReply(amqp_login(connection_, settings.vhost.c_str(), 0,
+                                131072, 0, AMQP_SASL_METHOD_PLAIN,
+                                settings.username.c_str(),
+                                settings.password.c_str()),
+                     "login");
+
+      amqp_channel_open(connection_, kChannel);
+      CheckAmqpReply(amqp_get_rpc_reply(connection_), "channel open");
+      opened_ = true;
+    } catch (...) {
+      if (connection_ != nullptr) {
+        amqp_destroy_connection(connection_);
+        connection_ = nullptr;
+      }
+      throw;
+    }
+  }
+
+  ~RabbitConnection() {
+    if (connection_ == nullptr) {
+      return;
+    }
+
+    if (opened_) {
+      amqp_channel_close(connection_, kChannel, AMQP_REPLY_SUCCESS);
+      amqp_connection_close(connection_, AMQP_REPLY_SUCCESS);
+    }
+    amqp_destroy_connection(connection_);
+  }
+
+  amqp_connection_state_t Get() const { return connection_; }
+
+ private:
+  amqp_connection_state_t connection_{nullptr};
+  bool opened_{false};
+};
+
+void DeclareTaskPlanningTopology(amqp_connection_state_t connection,
+                                 const RabbitMqSettings& settings) {
+  const auto channel = RabbitConnection::kChannel;
+  const auto exchange = amqp_cstring_bytes(settings.exchange.c_str());
+  constexpr auto kTopic = "topic";
+
+  amqp_exchange_declare(connection, channel, exchange,
+                        amqp_cstring_bytes(kTopic), 0, 1, 0, 0,
+                        amqp_empty_table);
+  CheckAmqpReply(amqp_get_rpc_reply(connection), "exchange declare");
+
+  const std::vector<std::pair<std::string, std::vector<std::string>>> queues = {
+      {"notification.queue",
+       {"task.created", "task.status_changed", "task.comment_added",
+        "notification.requested"}},
+      {"read_model.queue",
+       {"goal.created", "task.created", "task.status_changed",
+        "task.comment_added"}},
+      {"audit.queue", {"#"}},
+  };
+
+  for (const auto& [queue_name, bindings] : queues) {
+    const auto queue = amqp_cstring_bytes(queue_name.c_str());
+    amqp_queue_declare(connection, channel, queue, 0, 1, 0, 0,
+                       amqp_empty_table);
+    CheckAmqpReply(amqp_get_rpc_reply(connection), "queue declare");
+
+    for (const auto& binding : bindings) {
+      amqp_queue_bind(connection, channel, queue, exchange,
+                      amqp_cstring_bytes(binding.c_str()), amqp_empty_table);
+      CheckAmqpReply(amqp_get_rpc_reply(connection), "queue bind");
+    }
+  }
+}
+
+std::string CurrentUtcIso8601() {
+  const auto now = std::chrono::system_clock::now();
+  const auto now_time = std::chrono::system_clock::to_time_t(now);
+
+  std::tm utc_tm{};
+#if defined(_WIN32)
+  gmtime_s(&utc_tm, &now_time);
+#else
+  gmtime_r(&now_time, &utc_tm);
+#endif
+
+  std::ostringstream stream;
+  stream << std::put_time(&utc_tm, "%Y-%m-%dT%H:%M:%SZ");
+  return stream.str();
+}
+
+std::string GenerateEventId() {
+  static std::atomic<std::uint64_t> counter{0};
+  const auto now = std::chrono::system_clock::now();
+  const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now.time_since_epoch())
+                          .count();
+  return "evt-" + std::to_string(millis) + "-" +
+         std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+}
+
+class EventPublisher final : public components::ComponentBase {
+ public:
+  static constexpr std::string_view kName = "event-publisher";
+
+  EventPublisher(const components::ComponentConfig& config,
+                 const components::ComponentContext& context)
+      : ComponentBase(config, context),
+        settings_{config["host"].As<std::string>("rabbitmq"),
+                  config["port"].As<int>(5672),
+                  config["vhost"].As<std::string>("/"),
+                  config["username"].As<std::string>("task_planning"),
+                  config["password"].As<std::string>("task_planning"),
+                  config["exchange"].As<std::string>(
+                      "task_planning.events")} {
+    try {
+      RabbitConnection connection(settings_);
+      DeclareTaskPlanningTopology(connection.Get(), settings_);
+      LOG_INFO() << "RabbitMQ topology is ready: exchange="
+                 << settings_.exchange;
+    } catch (const std::exception& error) {
+      LOG_ERROR() << "RabbitMQ topology initialization failed: "
+                  << error.what();
+    }
+  }
+
+  void Publish(std::string_view event_type, json::ValueBuilder payload) const {
+    json::ValueBuilder event;
+    event["eventId"] = GenerateEventId();
+    event["eventType"] = std::string{event_type};
+    event["occurredAt"] = CurrentUtcIso8601();
+    event["producer"] = "task-planning-api";
+    event["version"] = 1;
+    event["payload"] = std::move(payload);
+
+    const auto body = json::ToString(event.ExtractValue());
+    const std::string routing_key{event_type};
+
+    try {
+      RabbitConnection connection(settings_);
+      DeclareTaskPlanningTopology(connection.Get(), settings_);
+
+      amqp_basic_properties_t properties{};
+      properties._flags =
+          AMQP_BASIC_CONTENT_TYPE_FLAG | AMQP_BASIC_DELIVERY_MODE_FLAG;
+      properties.content_type = amqp_cstring_bytes("application/json");
+      properties.delivery_mode = 2;
+
+      const auto publish_status = amqp_basic_publish(
+          connection.Get(), RabbitConnection::kChannel,
+          amqp_cstring_bytes(settings_.exchange.c_str()),
+          amqp_cstring_bytes(routing_key.c_str()), 0, 0, &properties,
+          MakeAmqpBytes(body));
+      if (publish_status != AMQP_STATUS_OK) {
+        std::string message = "RabbitMQ publish failed: ";
+        message += amqp_error_string2(publish_status);
+        throw std::runtime_error(message);
+      }
+
+      LOG_INFO() << "Published domain event " << routing_key;
+    } catch (const std::exception& error) {
+      LOG_ERROR() << "Could not publish domain event " << routing_key << ": "
+                  << error.what();
+    }
+  }
+
+ private:
+  RabbitMqSettings settings_;
+};
+
 json::ValueBuilder BuildError(std::string_view message) {
   json::ValueBuilder builder;
   builder["error"] = std::string{message};
@@ -926,7 +1159,8 @@ class ApiHandlerBase : public handlers::HttpHandlerBase {
       : HttpHandlerBase(config, context),
         storage_(context.FindComponent<PostgresStorage>()),
         mongo_storage_(context.FindComponent<MongoStorage>()),
-        redis_storage_(context.FindComponent<RedisStorage>()) {}
+        redis_storage_(context.FindComponent<RedisStorage>()),
+        event_publisher_(context.FindComponent<EventPublisher>()) {}
 
   std::string HandleRequestThrow(
       const http::HttpRequest& request,
@@ -965,6 +1199,7 @@ class ApiHandlerBase : public handlers::HttpHandlerBase {
   PostgresStorage& storage_;
   MongoStorage& mongo_storage_;
   RedisStorage& redis_storage_;
+  EventPublisher& event_publisher_;
 };
 
 class PingHandler final : public ApiHandlerBase {
@@ -1011,6 +1246,13 @@ class UsersHandler final : public ApiHandlerBase {
       throw ApiError{http::HttpStatus::kConflict,
                      "login or email already exists"};
     }
+
+    json::ValueBuilder payload;
+    payload["userId"] = created->id;
+    payload["login"] = created->login;
+    payload["email"] = created->email;
+    payload["role"] = created->role;
+    event_publisher_.Publish("user.created", std::move(payload));
 
     return MakeJsonResponse(request, http::HttpStatus::kCreated,
                             BuildUser(*created));
@@ -1137,6 +1379,13 @@ class GoalsHandler final : public ApiHandlerBase {
     const auto goal = storage_.CreateGoal(title, description, author_id);
     redis_storage_.Invalidate("goals:all");
 
+    json::ValueBuilder payload;
+    payload["goalId"] = goal.id;
+    payload["authorUserId"] = goal.author_id;
+    payload["title"] = goal.title;
+    payload["status"] = goal.status;
+    event_publisher_.Publish("goal.created", std::move(payload));
+
     return MakeJsonResponse(request, http::HttpStatus::kCreated,
                             BuildGoal(goal));
   }
@@ -1203,6 +1452,16 @@ class GoalTasksHandler final : public ApiHandlerBase {
     }
     redis_storage_.Invalidate(MakeGoalTasksCacheKey(goal_id));
 
+    json::ValueBuilder payload;
+    payload["taskId"] = task->id;
+    payload["goalId"] = task->goal_id;
+    payload["authorUserId"] = task->author_id;
+    payload["assigneeUserId"] = task->assignee_id;
+    payload["title"] = task->title;
+    payload["status"] = task->status;
+    payload["dueDate"] = task->due_date;
+    event_publisher_.Publish("task.created", std::move(payload));
+
     return MakeJsonResponse(request, http::HttpStatus::kCreated,
                             BuildTask(*task));
   }
@@ -1232,6 +1491,11 @@ class TaskStatusHandler final : public ApiHandlerBase {
       throw ApiError{http::HttpStatus::kBadRequest, "invalid task status"};
     }
 
+    const auto old_task = storage_.FindTask(goal_id, task_id);
+    if (!old_task.has_value()) {
+      throw ApiError{http::HttpStatus::kNotFound, "task not found"};
+    }
+
     const auto task = storage_.UpdateTaskStatus(goal_id, task_id, status);
     if (!task.has_value()) {
       throw ApiError{http::HttpStatus::kNotFound, "task not found"};
@@ -1239,6 +1503,14 @@ class TaskStatusHandler final : public ApiHandlerBase {
 
     redis_storage_.Invalidate(MakeGoalTasksCacheKey(goal_id));
     mongo_storage_.AddStatusChangedActivity(goal_id, task_id, actor_id, status);
+
+    json::ValueBuilder payload;
+    payload["taskId"] = task->id;
+    payload["goalId"] = task->goal_id;
+    payload["actorUserId"] = actor_id;
+    payload["oldStatus"] = old_task->status;
+    payload["newStatus"] = task->status;
+    event_publisher_.Publish("task.status_changed", std::move(payload));
 
     return MakeJsonResponse(request, http::HttpStatus::kOk, BuildTask(*task));
   }
@@ -1260,7 +1532,8 @@ class TaskCommentsHandler final : public ApiHandlerBase {
     if (!storage_.FindGoalById(goal_id).has_value()) {
       throw ApiError{http::HttpStatus::kNotFound, "goal not found"};
     }
-    if (!storage_.FindTask(goal_id, task_id).has_value()) {
+    const auto task = storage_.FindTask(goal_id, task_id);
+    if (!task.has_value()) {
       throw ApiError{http::HttpStatus::kNotFound, "task not found"};
     }
 
@@ -1285,6 +1558,22 @@ class TaskCommentsHandler final : public ApiHandlerBase {
 
     const auto comment = mongo_storage_.CreateTaskComment(
         goal_id, task_id, *author, text, tags);
+
+    json::ValueBuilder payload;
+    payload["taskId"] = task_id;
+    payload["goalId"] = goal_id;
+    payload["actorUserId"] = author_id;
+    payload["assigneeUserId"] = task->assignee_id;
+    payload["commentId"] = comment["_id"].As<bson::Oid>().ToString();
+    payload["textPreview"] =
+        text.size() <= 120 ? text : text.substr(0, 120);
+    json::ValueBuilder tags_payload(formats::common::Type::kArray);
+    for (const auto& tag : tags) {
+      tags_payload.PushBack(json::ValueBuilder{tag});
+    }
+    payload["tags"] = std::move(tags_payload);
+    event_publisher_.Publish("task.comment_added", std::move(payload));
+
     return MakeJsonResponse(request, http::HttpStatus::kCreated,
                             BuildTaskComment(comment));
   }
@@ -1335,6 +1624,7 @@ int main(int argc, char* argv[]) {
           .Append<task_planning::PostgresStorage>()
           .Append<task_planning::MongoStorage>()
           .Append<task_planning::RedisStorage>()
+          .Append<task_planning::EventPublisher>()
           .Append<task_planning::PingHandler>()
           .Append<task_planning::UsersHandler>()
           .Append<task_planning::LoginHandler>()

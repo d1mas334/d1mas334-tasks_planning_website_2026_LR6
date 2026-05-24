@@ -2,3 +2,6 @@ README_old.md
 build/
 .cache/
 .cmake/
+__pycache__/
+*.pyc
+*.pyc.*

@@ -3,6 +3,7 @@ const database = db.getSiblingDB('task_planning_mongo');
 database.task_activity.deleteMany({});
 database.task_comments.deleteMany({});
 database.notification_log.deleteMany({});
+database.event_log.deleteMany({});
 
 database.task_activity.insertMany([
   {
